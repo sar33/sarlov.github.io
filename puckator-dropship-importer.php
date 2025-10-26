@@ -845,126 +845,140 @@ foreach ( $num_fields as $field ) {
 	}
 
 	private function sync_products() {
-		if ( ! class_exists( 'WC_Product' ) ) {
-			return new WP_Error( 'no_wc', 'WooCommerce is required.' );
-		}
-		$lock_key = 'pdi_sync_lock_' . substr( md5( home_url() ), 0, 16 );
-		$now      = time();
-		$lock     = get_transient( $lock_key );
-		if ( $lock && ( $now - (int) $lock ) < 1800 ) {
-			$this->log( 'sync_skipped', [ 'reason' => 'locked' ] );
-			return [ 'updated' => 0 ];
-		}
-		set_transient( $lock_key, $now, 30 * MINUTE_IN_SECONDS );
-		try {
-			$feed = $this->fetch_feed( true );
-			if ( is_wp_error( $feed ) ) {
-				$this->log( 'sync_error', [ 'error' => $feed->get_error_message() ] );
-				return $feed;
-			}
-			$list = $this->extract_products( $feed );
-			if ( empty( $list ) ) {
-				$this->log( 'sync', [ 'updated' => 0, 'note' => 'Feed empty' ] );
-				return [ 'updated' => 0 ];
-			}
-			$by_sku = [];
-			foreach ( $list as $item ) {
-				$sku = isset( $item['sku'] ) ? trim( (string) $item['sku'] ) : '';
-				if ( $sku !== '' ) {
-					$by_sku[ strtoupper( $sku ) ] = $item;
-				}
-			}
-			$batch_size = 400;
-			$paged      = 1;
-			$updated    = 0;
-			$report     = [];
-			$restore_cache_flag = wp_suspend_cache_addition( true );
-			do {
-				$q = new WP_Query( [
-					'post_type'      => 'product',
-					'post_status'    => 'any',
-					'fields'         => 'ids',
-					'posts_per_page' => $batch_size,
-					'paged'          => $paged,
-					'no_found_rows'  => true,
-					'orderby'        => 'ID',
-					'order'          => 'ASC',
-					'meta_query'     => [ [ 'key' => '_sku', 'compare' => 'EXISTS' ] ],
-					'update_post_meta_cache' => false,
-					'update_post_term_cache' => false,
-				] );
-				$ids = $q->posts;
-				if ( empty( $ids ) ) break;
-				// Batch load all meta at once to eliminate N+1 queries
-$meta_keys = [ '_sku', '_regular_price', '_stock' ];
-$meta_data = [];
+    global $wpdb;
 
-if ( ! empty( $ids ) ) {
-    $placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-    
-    foreach ( $meta_keys as $meta_key ) {
-        $query = $wpdb->prepare(
-            "SELECT post_id, meta_value FROM {$wpdb->postmeta} 
-            WHERE post_id IN ($placeholders) AND meta_key = %s",
-            array_merge( $ids, [ $meta_key ] )
-        );
-        
-        $results = $wpdb->get_results( $query, ARRAY_A );
-        
-        foreach ( $results as $row ) {
-            if ( ! isset( $meta_data[ $row['post_id'] ] ) ) {
-                $meta_data[ $row['post_id'] ] = [];
-            }
-            $meta_data[ $row['post_id'] ][ $meta_key ] = $row['meta_value'];
+    if ( ! class_exists( 'WC_Product' ) ) {
+        return new WP_Error( 'no_wc', 'WooCommerce is required.' );
+    }
+    $lock_key = 'pdi_sync_lock_' . substr( md5( home_url() ), 0, 16 );
+    $now      = time();
+    $lock     = get_transient( $lock_key );
+    if ( $lock && ( $now - (int) $lock ) < 1800 ) {
+        $this->log( 'sync_skipped', [ 'reason' => 'locked' ] );
+        return [ 'updated' => 0 ];
+    }
+    set_transient( $lock_key, $now, 30 * MINUTE_IN_SECONDS );
+    try {
+        $feed = $this->fetch_feed( true );
+        if ( is_wp_error( $feed ) ) {
+            $this->log( 'sync_error', [ 'error' => $feed->get_error_message() ] );
+            return $feed;
         }
+        $list = $this->extract_products( $feed );
+        if ( empty( $list ) ) {
+            $this->log( 'sync', [ 'updated' => 0, 'note' => 'Feed empty' ] );
+            return [ 'updated' => 0 ];
+        }
+        $by_sku = [];
+        foreach ( $list as $item ) {
+            $sku = isset( $item['sku'] ) ? trim( (string) $item['sku'] ) : '';
+            if ( $sku !== '' ) {
+                $by_sku[ strtoupper( $sku ) ] = $item;
+            }
+        }
+        $batch_size = 400;
+        $paged      = 1;
+        $updated    = 0;
+        $report     = [];
+        $restore_cache_flag = wp_suspend_cache_addition( true );
+        do {
+            $q = new WP_Query( [
+                'post_type'      => 'product',
+                'post_status'    => 'any',
+                'fields'         => 'ids',
+                'posts_per_page' => $batch_size,
+                'paged'          => $paged,
+                'no_found_rows'  => true,
+                'orderby'        => 'ID',
+                'order'          => 'ASC',
+                'meta_query'     => [ [ 'key' => '_sku', 'compare' => 'EXISTS' ] ],
+                'update_post_meta_cache' => false,
+                'update_post_term_cache' => false,
+            ] );
+            $ids = $q->posts;
+            if ( empty( $ids ) ) break;
+
+            // Ensure IDs are integers and prepare placeholders
+            $ids = array_map( 'absint', $ids );
+
+            // Batch load all meta at once to eliminate N+1 queries
+            $meta_keys = [ '_sku', '_regular_price', '_stock' ];
+            $meta_data = [];
+
+            if ( ! empty( $ids ) ) {
+                $placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+
+                foreach ( $meta_keys as $meta_key ) {
+                    // Build args: all IDs followed by the meta_key placeholder
+                    $args = array_merge( $ids, [ $meta_key ] );
+
+                    // Use argument unpacking so each ID is a separate %d param
+                    $sql = "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+                        WHERE post_id IN ($placeholders) AND meta_key = %s";
+                    $query = $wpdb->prepare( $sql, ...$args );
+
+                    $results = $wpdb->get_results( $query, ARRAY_A );
+
+                    foreach ( $results as $row ) {
+                        $pid = isset( $row['post_id'] ) ? (int) $row['post_id'] : 0;
+                        if ( $pid === 0 ) {
+                            continue;
+                        }
+                        if ( ! isset( $meta_data[ $pid ] ) ) {
+                            $meta_data[ $pid ] = [];
+                        }
+                        $meta_data[ $pid ][ $meta_key ] = $row['meta_value'];
+                    }
+                }
+            }
+
+            foreach ( $ids as $pid ) {
+                $sku = isset( $meta_data[ $pid ]['_sku'] ) ? (string) $meta_data[ $pid ]['_sku'] : '';
+                if ( $sku === '' ) continue;
+
+                $key = strtoupper( trim( $sku ) );
+                if ( ! isset( $by_sku[ $key ] ) ) continue;
+
+                $item = $by_sku[ $key ];
+                $before = [
+                    'price' => isset( $meta_data[ $pid ]['_regular_price'] ) ? (float) $meta_data[ $pid ]['_regular_price'] : 0.0,
+                    'stock' => isset( $meta_data[ $pid ]['_stock'] ) ? (int) $meta_data[ $pid ]['_stock'] : 0,
+                ];
+
+                $res = $this->create_or_update_wc_product( $item, $pid );
+                if ( is_wp_error( $res ) ) continue;
+
+                // Refresh meta after update
+                $after = [
+                    'price' => (float) get_post_meta( $pid, '_regular_price', true ),
+                    'stock' => (int) get_post_meta( $pid, '_stock', true ),
+                ];
+
+                $changed = [];
+                if ( abs( $after['price'] - $before['price'] ) > 0.001 ) {
+                    $changed['price'] = [ 'from' => $before['price'], 'to' => $after['price'] ];
+                }
+                if ( $after['stock'] !== $before['stock'] ) {
+                    $changed['stock'] = [ 'from' => $before['stock'], 'to' => $after['stock'] ];
+                }
+                if ( $changed ) {
+                    $updated++;
+                    $report[] = [ 'product_id' => $pid, 'sku' => $sku, 'changed' => $changed ];
+                }
+            }
+
+            $this->log( 'sync_progress', [ 'batch' => $paged, 'updated' => $updated ] );
+            $paged++;
+            wp_reset_postdata();
+            $more = ( count( $ids ) === $batch_size );
+        } while ( $more );
+        wp_suspend_cache_addition( $restore_cache_flag );
+        $this->log( 'sync', [ 'updated' => $updated, 'details' => $report, 'note' => 'Matched by SKU (batched with progress)' ] );
+        return [ 'updated' => $updated ];
+    } finally {
+        delete_transient( $lock_key );
     }
 }
-
-foreach ( $ids as $pid ) {
-    $sku = isset( $meta_data[ $pid ]['_sku'] ) ? (string) $meta_data[ $pid ]['_sku'] : '';
-    if ( $sku === '' ) continue;
-    
-    $key = strtoupper( trim( $sku ) );
-    if ( ! isset( $by_sku[ $key ] ) ) continue;
-    
-    $item = $by_sku[ $key ];
-    $before = [
-        'price' => isset( $meta_data[ $pid ]['_regular_price'] ) ? (float) $meta_data[ $pid ]['_regular_price'] : 0.0,
-        'stock' => isset( $meta_data[ $pid ]['_stock'] ) ? (int) $meta_data[ $pid ]['_stock'] : 0,
-    ];
-    
-    $res = $this->create_or_update_wc_product( $item, $pid );
-    if ( is_wp_error( $res ) ) continue;
-    
-    // Refresh meta after update
-    $after = [
-        'price' => (float) get_post_meta( $pid, '_regular_price', true ),
-        'stock' => (int) get_post_meta( $pid, '_stock', true ),
-    ];
-					$changed = [];
-					if ( $after['price'] !== $before['price'] ) {
-						$changed['price'] = [ 'from' => $before['price'], 'to' => $after['price'] ];
-					}
-					if ( $after['stock'] !== $before['stock'] ) {
-						$changed['stock'] = [ 'from' => $before['stock'], 'to' => $after['stock'] ];
-					}
-					if ( $changed ) {
-						$updated++;
-						$report[] = [ 'product_id' => $pid, 'sku' => $sku, 'changed' => $changed ];
-					}
-				}
-				$this->log( 'sync_progress', [ 'batch' => $paged, 'updated' => $updated ] );
-				$paged++;
-				wp_reset_postdata();
-				$more = ( count( $ids ) === $batch_size );
-			} while ( $more );
-			wp_suspend_cache_addition( $restore_cache_flag );
-			$this->log( 'sync', [ 'updated' => $updated, 'details' => $report, 'note' => 'Matched by SKU (batched with progress)' ] );
-			return [ 'updated' => $updated ];
-		} finally {
-			delete_transient( $lock_key );
-		}
-	}
 
 	private function create_or_update_wc_product( array $item, $existing_id = 0 ) {
 		$sku = strtoupper( sanitize_text_field( $item['sku'] ?? '' ) );
