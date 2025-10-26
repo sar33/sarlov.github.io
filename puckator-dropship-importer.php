@@ -2,7 +2,7 @@
 /**
 * Plugin Name: Puckator Dropship Importer
 * Description: Import Puckator products into WooCommerce with secure API auth, fuzzy keyword/SKU search, dynamic pricing (price + weight-based shipping + VAT + PayPal + profit), daily sync at 06:00 (site timezone), manual sync, and admin logs.
-* Version: 3.2.2
+* Version: 3.3.0
 * Author: WordPress Plugin AI
 * Text Domain: puckator-dropship-importer
 * License: GPLv2 or later
@@ -10,7 +10,7 @@
 * Requires PHP: 7.4
 * Requires at least: 6.0
 * Tested up to: 6.8
-* Stable tag: 3.2.2
+* Stable tag: 3.3.0
 */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
@@ -110,23 +110,42 @@ final class PDI_Plugin {
 	}
 
 	private function check_rate_limit( string $action, int $limit = 10, int $period = 60 ): bool {
-		$user_id = get_current_user_id();
-		$key = "pdi_ratelimit_{$action}_{$user_id}";
-		$count = (int) get_transient( $key );
-
-		if ( $count >= $limit ) {
-			$this->log_security_event( 'rate_limit_exceeded', [
-				'action' => $action,
-				'user_id' => $user_id,
-				'limit' => $limit,
-				'attempts' => $count,
-			] );
-			return false;
-		}
-
-		set_transient( $key, $count + 1, $period );
-		return true;
-	}
+    $user_id = get_current_user_id();
+    $ip = $this->get_client_ip();
+    
+    // Check both user and IP to prevent multi-account abuse
+    $user_key = "pdi_ratelimit_{$action}_{$user_id}";
+    $ip_key = "pdi_ratelimit_{$action}_" . md5( $ip );
+    
+    $user_count = (int) get_transient( $user_key );
+    $ip_count = (int) get_transient( $ip_key );
+    
+    if ( $user_count >= $limit || $ip_count >= $limit ) {
+        // Implement progressive ban
+        $ban_key = "pdi_ban_{$action}_" . md5( "{$user_id}_{$ip}" );
+        $ban_count = (int) get_transient( $ban_key );
+        
+        $this->log_security_event( 'rate_limit_exceeded', [
+            'action' => $action,
+            'user_id' => $user_id,
+            'ip' => $ip,
+            'user_count' => $user_count,
+            'ip_count' => $ip_count,
+            'ban_count' => $ban_count,
+        ] );
+        
+        if ( $ban_count >= 3 ) {
+            set_transient( $ban_key, $ban_count + 1, HOUR_IN_SECONDS ); // 1 hour ban
+            return false;
+        }
+        set_transient( $ban_key, $ban_count + 1, 5 * MINUTE_IN_SECONDS );
+        return false;
+    }
+    
+    set_transient( $user_key, $user_count + 1, $period );
+    set_transient( $ip_key, $ip_count + 1, $period );
+    return true;
+}
 
 	private function minimize_item_for_client( array $p ): array {
 		return [
@@ -162,7 +181,7 @@ final class PDI_Plugin {
 			return;
 		}
 
-		wp_register_script( 'pdi-admin', false, [ 'jquery' ], '3.2.2', true );
+		wp_register_script( 'pdi-admin', false, [ 'jquery' ], '3.3.0', true );
 		wp_enqueue_script( 'pdi-admin' );
 		wp_add_inline_script( 'pdi-admin', $this->inline_js() );
 		wp_localize_script( 'pdi-admin', 'PDI', [
@@ -170,7 +189,7 @@ final class PDI_Plugin {
 			'nonce' => wp_create_nonce( 'pdi_nonce' ),
 		] );
 
-		wp_register_style( 'pdi-admin-css', false, [], '3.2.2' );
+		wp_register_style( 'pdi-admin-css', false, [], '3.3.0' );
 		wp_enqueue_style( 'pdi-admin-css' );
 		$css = '.pdi-row-imported { opacity: .6; } .pdi-badge-imported { display:inline-block; padding:2px 6px; font-size:11px; background:#e7f6ec; border:1px solid #9fd5b2; border-radius:3px; color:#1e7e34; margin-left:6px; } .pdi-row-imported input.pdi-item { pointer-events:none; }';
 		wp_add_inline_style( 'pdi-admin-css', $css );
@@ -229,21 +248,37 @@ final class PDI_Plugin {
 
 			$current_raw = get_option( self::OPT_SETTINGS, [] );
 			$current_encrypted_pw = isset( $current_raw['password'] ) ? (string) $current_raw['password'] : '';
-			$plain_pw = isset( $_POST['password'] ) ? sanitize_text_field( wp_unslash( $_POST['password'] ) ) : '';
-			$plain_pw = mb_substr( $plain_pw, 0, 256 );
-			$save['password'] = $plain_pw !== '' ? $this->encrypt_field( $plain_pw ) : $current_encrypted_pw;
+			// Don't sanitize passwords - it strips valid characters
+$plain_pw = isset( $_POST['password'] ) ? wp_unslash( $_POST['password'] ) : '';
+$plain_pw = mb_substr( $plain_pw, 0, 256, 'UTF-8' );
 
+if ( $plain_pw !== '' ) {
+    // Check for null bytes or control characters only
+    if ( preg_match( '/[\x00-\x08\x0B\x0C\x0E-\x1F]/', $plain_pw ) ) {
+        add_settings_error( 'pdi_settings', 'pdi_invalid_password', 
+            esc_html__( 'Password contains invalid characters.', 'puckator-dropship-importer' ), 'error' );
+        $save['password'] = $current_encrypted_pw;
+    } else {
+        $save['password'] = $this->encrypt_field( $plain_pw );
+    }
+} else {
+    $save['password'] = $current_encrypted_pw;
+}
 			$num_fields = [ 'vat', 'paypal_percent', 'paypal_fixed', 'profit_percent' ];
-			foreach ( $num_fields as $field ) {
-				$input_val = isset( $_POST[ $field ] ) ? sanitize_text_field( wp_unslash( $_POST[ $field ] ) ) : $s[ $field ];
-				$val = (float) $this->nf( $input_val );
-				if ( in_array( $field, [ 'vat', 'paypal_percent', 'profit_percent' ], true ) ) {
-					$val = max( 0.00, min( 100.00, $val ) );
-				} else {
-					$val = max( 0.00, min( 100.00, $val ) );
-				}
-				$save[ $field ] = number_format( $val, 2, '.', '' );
-			}
+foreach ( $num_fields as $field ) {
+    $input_val = isset( $_POST[ $field ] ) ? sanitize_text_field( wp_unslash( $_POST[ $field ] ) ) : $s[ $field ];
+    $val = (float) $this->nf( $input_val );
+    
+    // Validate percentage fields (0-100) and fixed fees (0+)
+    if ( in_array( $field, [ 'vat', 'paypal_percent', 'profit_percent' ], true ) ) {
+        $val = max( 0.00, min( 100.00, $val ) );
+    } else {
+        // paypal_fixed has no upper limit
+        $val = max( 0.00, $val );
+    }
+    
+    $save[ $field ] = number_format( $val, 2, '.', '' );
+}
 
 			$save['stock_field_path'] = sanitize_text_field( wp_unslash( $_POST['stock_field_path'] ?? $s['stock_field_path'] ) );
 			$save['price_field_key']  = sanitize_text_field( wp_unslash( $_POST['price_field_key']  ?? $s['price_field_key']  ) );
@@ -505,50 +540,62 @@ final class PDI_Plugin {
 	}
 
 	private function get_all_store_skus(): array {
-		global $wpdb;
-		$count = (int) $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id WHERE pm.meta_key = %s AND p.post_type = %s",
-				'_sku', 'product'
-			)
-		);
-		
-		if ( $count > 50000 ) {
-			return [];
-		}
-		
-		$cache_version = get_transient( self::CACHE_VERSION_TRANSIENT );
-		if ( ! $cache_version ) {
-			$cache_version = wp_generate_password( 12, false );
-			set_transient( self::CACHE_VERSION_TRANSIENT, $cache_version, 24 * HOUR_IN_SECONDS );
-		}
-		$cache_key = 'pdi_skus_cache_' . $cache_version;
-		
-		$cache = get_transient( $cache_key );
-		if ( is_array( $cache ) && $this->verify_cache_integrity( $cache ) ) {
-			return $cache;
-		}
-		
-		$query = $wpdb->prepare(
-			"SELECT pm.meta_value FROM {$wpdb->postmeta} pm
-			INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-			WHERE pm.meta_key = %s AND p.post_type = %s",
-			'_sku',
-			'product'
-		);
-		$rows = $wpdb->get_col( $query );
-		$out = [];
-		if ( $rows ) {
-			foreach ( $rows as $sku ) {
-				$sku = strtoupper( trim( (string) $sku ) );
-				if ( $sku !== '' && preg_match( '/^[A-Z0-9\-_]+$/i', $sku ) ) {
-					$out[ $sku ] = true;
-				}
-			}
-		}
-		set_transient( $cache_key, $out, 5 * MINUTE_IN_SECONDS );
-		return $out;
-	}
+    global $wpdb;
+    
+    // Try object cache first (Redis/Memcached support)
+    $cache_version = get_transient( self::CACHE_VERSION_TRANSIENT );
+    if ( ! $cache_version ) {
+        $cache_version = wp_generate_password( 12, false );
+        set_transient( self::CACHE_VERSION_TRANSIENT, $cache_version, DAY_IN_SECONDS );
+    }
+    $cache_key = 'pdi_skus_cache_' . $cache_version;
+    
+    // Check object cache first
+    $cache = wp_cache_get( $cache_key, 'pdi' );
+    if ( is_array( $cache ) && $this->verify_cache_integrity( $cache ) ) {
+        return $cache;
+    }
+    
+    // Check transient cache
+    $cache = get_transient( $cache_key );
+    if ( is_array( $cache ) && $this->verify_cache_integrity( $cache ) ) {
+        wp_cache_set( $cache_key, $cache, 'pdi', 5 * MINUTE_IN_SECONDS );
+        return $cache;
+    }
+    
+    // Optimized query: use LIMIT instead of COUNT + SELECT
+    $query = $wpdb->prepare(
+        "SELECT pm.meta_value FROM {$wpdb->postmeta} pm
+        INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+        WHERE pm.meta_key = %s AND p.post_type = %s
+        LIMIT 50001",
+        '_sku',
+        'product'
+    );
+    
+    $rows = $wpdb->get_col( $query );
+    
+    // If we hit the limit, don't cache (too many products)
+    if ( count( $rows ) > 50000 ) {
+        return [];
+    }
+    
+    $out = [];
+    if ( $rows ) {
+        foreach ( $rows as $sku ) {
+            $sku = strtoupper( trim( (string) $sku ) );
+            if ( $sku !== '' && preg_match( '/^[A-Z0-9\-_]+$/i', $sku ) ) {
+                $out[ $sku ] = true;
+            }
+        }
+    }
+    
+    // Cache in both transient and object cache
+    set_transient( $cache_key, $out, 5 * MINUTE_IN_SECONDS );
+    wp_cache_set( $cache_key, $out, 'pdi', 5 * MINUTE_IN_SECONDS );
+    
+    return $out;
+}
 
 	private function get_by_path( array $data, string $path ) {
 		$path = trim( $path );
@@ -732,31 +779,66 @@ final class PDI_Plugin {
 	}
 
 	public function activate() {
-		$this->ensure_cron_scheduled();
-		if ( get_option( self::OPT_SETTINGS, null ) === null ) {
-			add_option( self::OPT_SETTINGS, [], '', 'no' );
-		}
-		if ( get_option( self::OPT_LOGS, null ) === null ) {
-			add_option( self::OPT_LOGS, [], '', 'no' );
-		}
-		if ( get_option( self::OPT_SECURITY_LOGS, null ) === null ) {
-			add_option( self::OPT_SECURITY_LOGS, [], '', 'no' );
-		}
-	}
+    // Check WooCommerce dependency first
+    if ( ! class_exists( 'WooCommerce' ) ) {
+        deactivate_plugins( plugin_basename( __FILE__ ) );
+        wp_die( 
+            '<h1>' . esc_html__( 'WooCommerce Required', 'puckator-dropship-importer' ) . '</h1>' .
+            '<p>' . esc_html__( 'Puckator Dropship Importer requires WooCommerce to be installed and active.', 'puckator-dropship-importer' ) . '</p>' .
+            '<p><a href="' . esc_url( admin_url( 'plugins.php' ) ) . '">' . esc_html__( 'Return to Plugins', 'puckator-dropship-importer' ) . '</a></p>',
+            esc_html__( 'Plugin Activation Error', 'puckator-dropship-importer' ),
+            [ 'back_link' => true ]
+        );
+    }
+    
+    $this->ensure_cron_scheduled();
+    if ( get_option( self::OPT_SETTINGS, null ) === null ) {
+        add_option( self::OPT_SETTINGS, [], '', 'no' );
+    }
+    if ( get_option( self::OPT_LOGS, null ) === null ) {
+        add_option( self::OPT_LOGS, [], '', 'no' );
+    }
+    if ( get_option( self::OPT_SECURITY_LOGS, null ) === null ) {
+        add_option( self::OPT_SECURITY_LOGS, [], '', 'no' );
+    }
+}
 
 	public function deactivate() { 
 		wp_clear_scheduled_hook( self::CRON_HOOK ); 
 	}
 
 	private function ensure_cron_scheduled() {
-		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
-			$tz  = wp_timezone();
-			$now = new DateTime( 'now', $tz );
-			$run = new DateTime( 'today 06:00:00', $tz );
-			if ( $run <= $now ) $run->modify( '+1 day' );
-			wp_schedule_event( $run->getTimestamp(), 'daily', self::CRON_HOOK );
-		}
-	}
+    $next = wp_next_scheduled( self::CRON_HOOK );
+    
+    if ( $next ) {
+        // Check if scheduled time is within 1 hour of 6 AM target
+        $tz = wp_timezone();
+        $scheduled_time = new DateTime( '@' . $next );
+        $scheduled_time->setTimezone( $tz );
+        
+        $target_time = new DateTime( 'today 06:00:00', $tz );
+        if ( $target_time <= new DateTime( 'now', $tz ) ) {
+            $target_time->modify( '+1 day' );
+        }
+        
+        // If already scheduled within 1 hour of target, don't reschedule
+        if ( abs( $next - $target_time->getTimestamp() ) < 3600 ) {
+            return;
+        }
+    }
+    
+    // Clear any existing schedule and create new one
+    wp_clear_scheduled_hook( self::CRON_HOOK );
+    
+    $tz = wp_timezone();
+    $now = new DateTime( 'now', $tz );
+    $run = new DateTime( 'today 06:00:00', $tz );
+    if ( $run <= $now ) {
+        $run->modify( '+1 day' );
+    }
+    
+    wp_schedule_event( $run->getTimestamp(), 'daily', self::CRON_HOOK );
+}
 
 	public function cron_sync() { 
 		$this->sync_products(); 
@@ -813,22 +895,52 @@ final class PDI_Plugin {
 				] );
 				$ids = $q->posts;
 				if ( empty( $ids ) ) break;
-				foreach ( $ids as $pid ) {
-					$sku = (string) get_post_meta( $pid, '_sku', true );
-					if ( $sku === '' ) continue;
-					$key = strtoupper( trim( $sku ) );
-					if ( ! isset( $by_sku[ $key ] ) ) continue;
-					$item   = $by_sku[ $key ];
-					$before = [
-						'price' => (float) get_post_meta( $pid, '_regular_price', true ),
-						'stock' => (int)   get_post_meta( $pid, '_stock', true ),
-					];
-					$res = $this->create_or_update_wc_product( $item, $pid );
-					if ( is_wp_error( $res ) ) continue;
-					$after = [
-						'price' => (float) get_post_meta( $pid, '_regular_price', true ),
-						'stock' => (int)   get_post_meta( $pid, '_stock', true ),
-					];
+				// Batch load all meta at once to eliminate N+1 queries
+$meta_keys = [ '_sku', '_regular_price', '_stock' ];
+$meta_data = [];
+
+if ( ! empty( $ids ) ) {
+    $placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+    
+    foreach ( $meta_keys as $meta_key ) {
+        $query = $wpdb->prepare(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta} 
+            WHERE post_id IN ($placeholders) AND meta_key = %s",
+            array_merge( $ids, [ $meta_key ] )
+        );
+        
+        $results = $wpdb->get_results( $query, ARRAY_A );
+        
+        foreach ( $results as $row ) {
+            if ( ! isset( $meta_data[ $row['post_id'] ] ) ) {
+                $meta_data[ $row['post_id'] ] = [];
+            }
+            $meta_data[ $row['post_id'] ][ $meta_key ] = $row['meta_value'];
+        }
+    }
+}
+
+foreach ( $ids as $pid ) {
+    $sku = isset( $meta_data[ $pid ]['_sku'] ) ? (string) $meta_data[ $pid ]['_sku'] : '';
+    if ( $sku === '' ) continue;
+    
+    $key = strtoupper( trim( $sku ) );
+    if ( ! isset( $by_sku[ $key ] ) ) continue;
+    
+    $item = $by_sku[ $key ];
+    $before = [
+        'price' => isset( $meta_data[ $pid ]['_regular_price'] ) ? (float) $meta_data[ $pid ]['_regular_price'] : 0.0,
+        'stock' => isset( $meta_data[ $pid ]['_stock'] ) ? (int) $meta_data[ $pid ]['_stock'] : 0,
+    ];
+    
+    $res = $this->create_or_update_wc_product( $item, $pid );
+    if ( is_wp_error( $res ) ) continue;
+    
+    // Refresh meta after update
+    $after = [
+        'price' => (float) get_post_meta( $pid, '_regular_price', true ),
+        'stock' => (int) get_post_meta( $pid, '_stock', true ),
+    ];
 					$changed = [];
 					if ( $after['price'] !== $before['price'] ) {
 						$changed['price'] = [ 'from' => $before['price'], 'to' => $after['price'] ];
@@ -901,10 +1013,18 @@ final class PDI_Plugin {
 		}
 
 		$product_id = $product->save();
-		update_post_meta( $product_id, self::META_SOURCE_FLAG, 1 );
-		update_post_meta( $product_id, self::META_SOURCE_SKU,  $sku );
+update_post_meta( $product_id, self::META_SOURCE_FLAG, 1 );
+update_post_meta( $product_id, self::META_SOURCE_SKU,  $sku );
 
-		return $product_id;
+// Invalidate SKU cache when product is created/updated
+$cache_version = get_transient( self::CACHE_VERSION_TRANSIENT );
+if ( $cache_version ) {
+    $cache_key = 'pdi_skus_cache_' . $cache_version;
+    delete_transient( $cache_key );
+    wp_cache_delete( $cache_key, 'pdi' );
+}
+
+return $product_id;
 	}
 
 	private function fetch_feed( bool $bypass_cache = false ) {
